@@ -74,6 +74,15 @@ class RegexGuardTests(unittest.TestCase):
         for pat in (r"(a+)+$", r"(a*)*", r"(?:\w+\s?)+$", r"(a+){2,}", r"((a+)b)+", r"(.*a){20}"):
             self.assertIn("repeat", lahja.regex_problem(pat) or "", pat)
 
+    def test_verbose_flag_and_optional_parts_cannot_hide_a_nested_repeat(self):
+        for pat in (r"(?x)(a+) +$", r"(?ix) (a+) +", r"(?x:(a+) +)", r"(a?){30}a{30}", r"(?:ab?)+c"):
+            self.assertIsNotNone(lahja.regex_problem(pat), pat)
+        self.assertIsNone(lahja.regex_problem(r"(?i)ab?c+"))
+        self.assertIsNone(lahja.regex_problem(r"(?P<x>a+)b"))
+
+    def test_file_names_are_cleaned_for_display(self):
+        self.assertEqual(lahja.show_path("a\x1b[31m‮b\\c.txt"), "a [31mb/c.txt")
+
     def test_alternation_inside_repeated_group_is_rejected(self):
         for pat in (r"(a|aa)+$", r"(?:x|xy)*z", r"((a|b)c)+"):
             self.assertIsNotNone(lahja.regex_problem(pat), pat)
@@ -332,7 +341,7 @@ class PositionTests(unittest.TestCase):
     def test_column_counts_code_points_not_bytes(self):
         found = lint("مرحبا X", rule(kind="latin"))
         self.assertEqual(found[0]["col"], 7)
-        found = lint("\U0001F600 X", rule(kind="latin"))
+        found = lint(chr(0x1F600) + " X", rule(kind="latin"))
         self.assertEqual(found[0]["col"], 3)
 
     def test_line_filter_keeps_original_columns(self):

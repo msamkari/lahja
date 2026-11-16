@@ -36,6 +36,7 @@ DEFAULT_TIMEOUT = 30.0
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 BRACE_RE = re.compile(r"\{(\d*)(,)?(\d*)\}")
+INLINE_VERBOSE_RE = re.compile(r"\(\?[a-zA-Z]*-?[a-zA-Z]*x")
 NEWLINE_RE = re.compile(r"\r\n|\n|\r")
 
 # Arabic combining marks (harakat, tanween, shadda, sukun, dagger alef) and tatweel.
@@ -140,13 +141,13 @@ def regex_problem(pat):
         if mx is not None and mx > MAX_REPEAT:
             return i, "uses a repeat count above %d" % MAX_REPEAT
         if repeats and inner_complex:
-            return i, ("repeats a group that itself contains a repeat or an alternation "
+            return i, ("repeats a group that itself contains a repeat, an optional part or an alternation "
                        "(this can take exponential time)")
         if mx is None:
             state["unbounded"] += 1
             if state["unbounded"] > MAX_UNBOUNDED:
                 return i, "uses more than %d unbounded repeats (* + {n,})" % MAX_UNBOUNDED
-        if repeats:
+        if repeats or mx == 1:
             stack[-1] = True
         i += length
         if i < n and pat[i] in "?+":
@@ -178,6 +179,8 @@ def regex_problem(pat):
                 return "uses a backreference (not allowed)"
             if pat.startswith("(?(", i):
                 return "uses a conditional group (not allowed)"
+            if INLINE_VERBOSE_RE.match(pat, i):
+                return "uses the verbose flag x (not allowed)"
             stack.append(False)
             i += 1
             problem = None

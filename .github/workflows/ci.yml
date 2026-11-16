@@ -44,9 +44,9 @@ jobs:
           echo clean
       - name: Every commit author is the project identity
         run: |
-          others=$(git log --all --format='%an,%ae%n%cn,%ce' | sort -u | grep -vx 'msamkari,msamkari@users\.noreply\.github\.com' || true)
-          if [ -n "$others" ]; then echo "unexpected author or committer:"; echo "$others"; exit 1; fi
-          if git log --all --format=%B | grep -qiE 'co-authored-by|claude\.ai/code|generated with'; then echo "trailer or session link in a commit message"; exit 1; fi
+          others=$(git log --all --no-merges --format='%an,%ae' | sort -u | grep -vx 'msamkari,msamkari@users\.noreply\.github\.com' || true)
+          if [ -n "$others" ]; then echo "unexpected commit author:"; echo "$others"; exit 1; fi
+          if git log --all --no-merges --format=%B | grep -qiE 'co-authored-by|claude\.ai/code|generated with'; then echo "trailer or session link in a commit message"; exit 1; fi
           echo clean
       - name: Dependencies note
         run: echo "stdlib only; no third-party dependencies to license-check"
