@@ -1,0 +1,137 @@
+{
+  "id": "saudi",
+  "label": "Saudi white dialect (Gulf, Najdi-leaning) for voiceover",
+  "description": "Catches formal (fus-ha) wording and text that speech engines misread in scripts meant to be spoken in everyday Saudi dialect.",
+  "rules": [
+    {
+      "id": "tanween",
+      "kind": "regex",
+      "pattern": "[ًٌٍ]",
+      "severity": "error",
+      "message": "تنوين: يُنطق فصيحاً في الصوت",
+      "fix": "احذف التنوين وسكّن آخر الكلمة (تمام بدل تماماً، كثير بدل كثيراً)",
+      "allow": ["دايماً"]
+    },
+    {
+      "id": "latin",
+      "kind": "latin",
+      "severity": "error",
+      "message": "حروف لاتينية في نص منطوق: محرك الصوت قد يتهجّاها حرفاً حرفاً",
+      "fix": "اكتبها بالحروف العربية كما تُنطق (بي دي إف، إيميل، أونلاين) أو ضعها بين «…» إن كانت للعرض فقط",
+      "ignore_inside": [["«", "»"], ["[", "]"]]
+    },
+    {
+      "id": "numerals",
+      "kind": "numeral",
+      "severity": "error",
+      "message": "رقم بالأرقام في نص منطوق",
+      "fix": "اكتبه حروفاً بالصيغة الدارجة (ثلاثين يوم، ستة شهور، ثلاثة فاصلة خمسة)"
+    },
+    {
+      "id": "formal-particles",
+      "kind": "wordlist",
+      "severity": "error",
+      "message": "أداة فصيحة لا تُقال في الدارجة",
+      "prefixes": ["و", "ف"],
+      "words": [
+        {"word": "ماذا", "fix": "وش / إيش"},
+        {"word": "لماذا", "fix": "ليه / ليش"},
+        {"word": "سوف", "fix": "باء المستقبل على الفعل (بروح، بسوي)"},
+        {"word": "الذي", "fix": "اللي"},
+        {"word": "التي", "fix": "اللي"},
+        {"word": "الذين", "fix": "اللي"},
+        {"word": "هكذا", "fix": "كذا"},
+        {"word": "لكي", "fix": "عشان"}
+      ]
+    },
+    {
+      "id": "formal-words",
+      "kind": "wordlist",
+      "severity": "warn",
+      "message": "كلمة فصيحة قد تثقل النص المنطوق",
+      "prefixes": ["و", "ف"],
+      "words": [
+        {"word": "أين", "fix": "وين"},
+        {"word": "هذه", "fix": "هذي"},
+        {"word": "لأن", "fix": "عشان"},
+        {"word": "فقط", "fix": "بس"},
+        {"word": "لكن", "fix": "بس"},
+        {"word": "الآن", "fix": "الحين"},
+        {"word": "لاحقا", "fix": "بعدين"},
+        {"word": "مجددا", "fix": "مرة ثانية"},
+        {"word": "يجب", "fix": "لازم / ضروري / المفروض"},
+        {"word": "ينبغي", "fix": "لازم / المفروض"},
+        {"word": "يتوجب", "fix": "لازم"},
+        {"word": "أريد", "fix": "أبي / أبغى"},
+        {"word": "تريد", "fix": "تبي / تبغى"},
+        {"word": "يريد", "fix": "يبي / يبغى"},
+        {"word": "نريد", "fix": "نبي / نبغى"},
+        {"word": "أستطيع", "fix": "أقدر"},
+        {"word": "تستطيع", "fix": "تقدر"},
+        {"word": "يستطيع", "fix": "يقدر"},
+        {"word": "نستطيع", "fix": "نقدر"},
+        {"word": "اثنتا عشرة", "fix": "اثنعش"},
+        {"word": "اثنا عشر", "fix": "اثنعش"}
+      ]
+    },
+    {
+      "id": "formal-plurals",
+      "kind": "wordlist",
+      "severity": "warn",
+      "message": "جمع فصيح؛ الدارج أخف على اللسان",
+      "prefixes": ["و", "ف", "ال"],
+      "words": [
+        {"word": "أشهر", "fix": "شهور"},
+        {"word": "سنوات", "fix": "سنين"}
+      ]
+    },
+    {
+      "id": "kaf-vowel",
+      "kind": "regex",
+      "pattern": "ك[َُ](?![\\wً-ٰٟ])",
+      "severity": "warn",
+      "message": "حركة على كاف الخطاب في آخر الكلمة: تُنطق فصيحة",
+      "fix": "اترك الكاف ساكنة أو بلا تشكيل (جوازك، حسابك)"
+    },
+    {
+      "id": "tts-symbols",
+      "kind": "regex",
+      "pattern": "[%&@#$+=<>~^|]",
+      "severity": "warn",
+      "message": "رمز قد يقرأه محرك الصوت خطأ أو يتجاهله",
+      "fix": "اكتب معناه كلمة (بالمية، و، زائد)"
+    },
+    {
+      "id": "repeated-punctuation",
+      "kind": "regex",
+      "pattern": "[!?؟]{2,}",
+      "severity": "warn",
+      "message": "علامات متكررة: لا تضيف نبرة في الصوت وقد تربك المحرك",
+      "fix": "علامة واحدة تكفي"
+    },
+    {
+      "id": "latin-punctuation",
+      "kind": "regex",
+      "pattern": "(?<=[؀-ۿ])[,;?]",
+      "severity": "warn",
+      "message": "علامة ترقيم لاتينية بعد كلمة عربية",
+      "fix": "استعمل الفاصلة العربية ، أو ؛ أو ؟"
+    },
+    {
+      "id": "tatweel",
+      "kind": "regex",
+      "pattern": "ـ+",
+      "severity": "warn",
+      "message": "تطويل (كشيدة) داخل الكلمة قد يكسر نطقها",
+      "fix": "احذف التطويل"
+    },
+    {
+      "id": "long-sentence",
+      "kind": "length",
+      "max_words": 25,
+      "severity": "warn",
+      "message": "جملة طويلة على نفَس واحد",
+      "fix": "قسّمها بنقطة أو اجعل كل جملة في سطر"
+    }
+  ]
+}

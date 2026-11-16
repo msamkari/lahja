@@ -1,0 +1,43 @@
+{
+  "id": "plain-english",
+  "label": "Plain spoken English (example pack)",
+  "description": "A small example to copy when you write your own pack. Not a complete style guide.",
+  "_comment": "Keys that start with an underscore are ignored, so you can leave notes like this one.",
+  "rules": [
+    {
+      "id": "stiff-words",
+      "kind": "wordlist",
+      "severity": "warn",
+      "message": "Stiff word; nobody says this out loud",
+      "words": [
+        {"word": "utilize", "fix": "use"},
+        {"word": "commence", "fix": "start"},
+        {"word": "in order to", "fix": "to"},
+        "henceforth"
+      ]
+    },
+    {
+      "id": "digits",
+      "kind": "numeral",
+      "severity": "error",
+      "message": "Digits in a spoken line",
+      "fix": "Spell the number the way you would say it"
+    },
+    {
+      "id": "abbreviation-dots",
+      "kind": "regex",
+      "pattern": "\\b(?:e\\.g\\.|i\\.e\\.|etc\\.)",
+      "ignore_case": true,
+      "severity": "warn",
+      "message": "Abbreviation that a speech engine may spell out or pause on",
+      "fix": "Write it as words: for example, that is, and so on"
+    },
+    {
+      "id": "long-sentence",
+      "kind": "length",
+      "max_words": 30,
+      "severity": "warn",
+      "message": "Long sentence for one breath"
+    }
+  ]
+}
