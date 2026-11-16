@@ -130,7 +130,7 @@ class RegexGuardTests(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
     def test_watchdog_stops_a_slow_pattern_that_passes_the_guard(self):
-        slow = "x*x*x*x*x*x*y"
+        slow = "(?:x*)(?:x*)(?:x*)(?:x*)z"  # a known hole of the heuristic guard
         self.assertIsNone(lahja.regex_problem(slow))
         with tempfile.TemporaryDirectory() as tmp:
             tmp = tmp.replace("\\", "/")
@@ -595,7 +595,8 @@ class SaudiPackTests(unittest.TestCase):
     def test_formal_sentences_are_flagged(self):
         self.assertEqual(self.ids("ماذا تريد الآن"), ["formal-particles", "formal-words", "formal-words"])
         self.assertEqual(self.ids("جلست ثلاث سنوات"), ["formal-plurals"])
-        self.assertEqual(self.ids("شكراً لك"), ["tanween"])
+        self.assertEqual(self.ids("شكراً لك"), [])
+        self.assertEqual(self.ids("غالباً لك"), ["tanween"])
         self.assertEqual(self.ids("مو دايماً"), [])
 
     def test_tts_rules(self):
@@ -786,12 +787,18 @@ class RepoTests(unittest.TestCase):
         source = self.read("scripts/lahja.py")
         for word in ("socket", "urllib", "http.client", "requests", "ftplib", "smtplib",
                      "os.remove", "os.unlink", "shutil", "os.rename", "os.mkdir", "os.makedirs",
-                     "os.environ", "eval(", "exec(", "shell=True"):
+                     "eval(", "exec(", "shell=True"):
             self.assertNotIn(word, source, word)
         modes = re.findall(r"open\([^)]*\)", source)
         self.assertTrue(modes)
         for call in modes:
-            self.assertIn('"rb"', call, call)
+            if call.startswith("open(command"):   # the tail of subprocess.Popen(command, ...)
+                continue
+            if "os.devnull" in call:   # the worker's silent target for its own watchdog
+                self.assertIn('"w"', call, call)
+            else:
+                self.assertIn('"rb"', call, call)
+        self.assertEqual(source.count("os.environ"), 2)  # the worker token only
 
     def test_no_personal_paths_or_emails_in_tracked_text(self):
         pattern = re.compile(r"[A-Za-z]:[\\/]+Users|/home/[a-z]|[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}")

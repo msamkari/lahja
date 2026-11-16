@@ -20,6 +20,8 @@ python ${CLAUDE_PLUGIN_ROOT}/scripts/lahja.py --list-packs
 - `--line-filter '<regex>'`: lint only the lines that match; when the regex has a group, only group 1 is linted. Use it when the file mixes spoken lines with headings or notes and the user tells you how spoken lines are marked.
 - `--all-lines` / `--tagged-only`: override the pack's scope for one run. The built-in `saudi` pack lints only lines that start with a `[tag]`; if a script has no tags, add `--all-lines`.
 
+If the summary says `N untagged line(s) skipped`, tell the user that those lines were not checked and offer `--all-lines`. Never pass a device name (CON, NUL, AUX) as a file.
+
 Output: one line per finding, `file:line:col: severity pack/rule: message | text: "..." | fix: ...`, then a summary line. Columns count characters from 1. Exit code 0 means clean (or warnings only), 2 means at least one `error` finding, 1 means the tool could not do its job (missing file, bad pack, not UTF-8, timeout): report the message as is.
 
 Rules:

@@ -10,14 +10,19 @@ Standard library only, Python 3.8+.
 Exit codes: 0 clean (or warnings only), 2 findings with severity "error", 1 tool error.
 """
 import argparse
+import faulthandler
+import functools
+import hmac
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import threading
 import unicodedata
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_PACK_BYTES = 256 * 1024
@@ -29,13 +34,23 @@ MAX_WORD_LEN = 80
 MAX_PATTERN_LEN = 300
 MAX_TEXT_FIELD = 300
 MAX_LINE_CHARS = 2000
-MAX_UNBOUNDED = 6
+MAX_UNBOUNDED = 4      # wide repeats (* + {n,} or a bounded repeat above WIDE_REPEAT) per pattern
+MAX_ADJACENT = 2       # wide repeats directly next to each other, like .*.*.*
+MAX_OPTIONAL = 6       # optional parts (? or {0,1}) per pattern
+WIDE_REPEAT = 10
 MAX_REPEAT = 1000
 MAX_FINDINGS_PER_FILE = 500
 SNIPPET_CHARS = 60
 DEFAULT_TIMEOUT = 30.0
+WORKER_GRACE = 3.0         # the worker's own deadline is the timeout plus this many seconds
+MAX_PAYLOAD = 4 * 1024 * 1024
+TOKEN_ENV = "LAHJA_WORKER_TOKEN"
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+RESERVED_NAMES = frozenset(["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+                           + ["COM%d" % i for i in range(1, 10)] + ["LPT%d" % i for i in range(1, 10)])
+# Invisible characters an editor may put in front of a tag: RLM, LRM, ZWSP, BOM, NBSP, bidi controls.
+LEADING_INVISIBLE_RE = re.compile(r"[\s\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\u061c\u00ad\ufeff]+")
 BRACE_RE = re.compile(r"\{(\d*)(,)?(\d*)\}")
 INLINE_VERBOSE_RE = re.compile(r"\(\?[a-zA-Z]*-?[a-zA-Z]*x")
 NEWLINE_RE = re.compile(r"\r\n|\n|\r")
@@ -43,7 +58,6 @@ NEWLINE_RE = re.compile(r"\r\n|\n|\r")
 # Arabic combining marks (harakat, tanween, shadda, sukun, dagger alef) and tatweel.
 MARKS = "\u064B-\u065F\u0670\u0640"
 MARKS_RE = re.compile("[" + MARKS + "]")
-BOUNDARY_CLASS = "[\\w" + MARKS + "]"
 DIGITS = "0-9\u0660-\u0669\u06F0-\u06F9"
 NUMERAL_RE = re.compile("[" + DIGITS + "]+(?:[.,\u066B\u066C:/][" + DIGITS + "]+)*")
 LATIN = "A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u024F"
@@ -124,9 +138,11 @@ def _quantifier_at(pat, j):
 def regex_problem(pat):
     """Structural complexity guard. Returns a reason string, or None when the pattern is accepted.
 
-    The standard library has no regex timeout, so patterns that can backtrack
-    catastrophically are refused up front: nested repeats, alternation inside a
-    repeated group, backreferences, conditionals, very large repeat counts.
+    This is a HEURISTIC, not a proof. The standard library has no regex timeout, so patterns that
+    can backtrack badly are refused up front: nested repeats, alternation inside a repeated group,
+    backreferences, conditionals, very large repeat counts, too many wide repeats (* + {n,} or a
+    large {n,m}) or too many of them in a row (.*.*.*), too many optional parts. Some slow
+    patterns still pass; the real guard is the time limit on the worker process (--timeout).
     """
     if not isinstance(pat, str) or pat == "":
         return "must be a non-empty string"
@@ -134,11 +150,12 @@ def regex_problem(pat):
         return "is longer than %d characters" % MAX_PATTERN_LEN
     n = len(pat)
     stack = [False]  # per open group: does it contain a repeat or an alternation?
-    state = {"unbounded": 0}
+    state = {"wide": 0, "optional": 0, "run": 0}
 
     def apply_quantifier(i, inner_complex):
         q = _quantifier_at(pat, i)
         if q is None:
+            state["run"] = 0
             return i, None
         length, mx = q
         repeats = mx is None or mx > 1
@@ -147,10 +164,21 @@ def regex_problem(pat):
         if repeats and inner_complex:
             return i, ("repeats a group that itself contains a repeat, an optional part or an alternation "
                        "(this can take exponential time)")
-        if mx is None:
-            state["unbounded"] += 1
-            if state["unbounded"] > MAX_UNBOUNDED:
-                return i, "uses more than %d unbounded repeats (* + {n,})" % MAX_UNBOUNDED
+        if mx == 1:
+            state["optional"] += 1
+            if state["optional"] > MAX_OPTIONAL:
+                return i, "uses more than %d optional parts (? or {0,1})" % MAX_OPTIONAL
+        if mx is None or mx > WIDE_REPEAT:
+            state["wide"] += 1
+            state["run"] += 1
+            if state["wide"] > MAX_UNBOUNDED:
+                return i, ("uses more than %d unbounded or large repeats (* + {n,} {n,m})"
+                           % MAX_UNBOUNDED)
+            if state["run"] > MAX_ADJACENT:
+                return i, ("has more than %d unbounded or large repeats in a row (like .*.*.*)"
+                           % MAX_ADJACENT)
+        else:
+            state["run"] = 0
         if repeats or mx == 1:
             stack[-1] = True
         i += length
@@ -186,6 +214,7 @@ def regex_problem(pat):
             if INLINE_VERBOSE_RE.match(pat, i):
                 return "uses the verbose flag x (not allowed)"
             stack.append(False)
+            state["run"] = 0
             i += 1
             problem = None
         elif c == ")":
@@ -197,6 +226,7 @@ def regex_problem(pat):
                 stack[-1] = True
         elif c == "|":
             stack[-1] = True
+            state["run"] = 0
             i += 1
             problem = None
         else:
@@ -258,19 +288,58 @@ def _positive_int(obj, key, what):
     return value
 
 
+COMBINERS = "\u0653\u0654\u0655"   # madda / hamza above / hamza below: they compose with alef, waw, yeh
+TOKEN_RE = re.compile(r"\w+|\s+|[^\w\s]")
+
+
 def _strip_marks(text):
     return MARKS_RE.sub("", text)
 
 
-def _word_key(text):
-    return " ".join(_strip_marks(text).split()).lower()
+@functools.lru_cache(maxsize=512)
+def _prep(text):
+    """Normalise text for word matching and cut it into tokens, keeping a map back to the original.
+
+    Marks and tatweel are dropped, a base letter plus a combining hamza/madda is composed (so text
+    saved in decomposed form still matches), letters are lower-cased one by one (so the length never
+    changes). Returns (norm, starts, ends, tokens, token_starts, token_ends); starts/ends map each
+    normalised character to its span in the original text, tokens are runs of word characters, single other
+    characters, or " " for a whitespace run.
+    """
+    out, starts, ends = [], [], []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if MARKS_RE.match(ch):
+            i += 1
+            continue
+        j = i + 1
+        if j < n and text[j] in COMBINERS:
+            composed = unicodedata.normalize("NFC", ch + text[j])
+            if len(composed) == 1:
+                ch = composed
+                j += 1
+        low = ch.lower()
+        out.append(low if len(low) == 1 else ch)
+        starts.append(i)
+        ends.append(j)
+        i = j
+    norm = "".join(out)
+    tokens, tstarts, tends = [], [], []
+    for m in TOKEN_RE.finditer(norm):
+        tok = m.group()
+        tokens.append(" " if tok.isspace() else tok)
+        tstarts.append(m.start())
+        tends.append(m.end())
+    return norm, tuple(starts), tuple(ends), tuple(tokens), tuple(tstarts), tuple(tends)
 
 
-def _word_regex(word):
-    parts = []
-    for token in word.split():
-        parts.append("".join(re.escape(ch) + "[" + MARKS + "]*" for ch in token))
-    return "\\s+".join(parts)
+def _word_tokens(word):
+    return _prep(" ".join(word.split()))[3]
+
+
+def _is_word_char(ch):
+    return ch.isalnum() or ch == "_"
 
 
 def _build_wordlist(rule, what):
@@ -279,8 +348,7 @@ def _build_wordlist(rule, what):
         raise PackError("%s: \"words\" must be a non-empty list" % what)
     if len(words) > MAX_WORDS:
         raise PackError("%s: \"words\" has more than %d entries" % (what, MAX_WORDS))
-    fixes = {}
-    keys = []
+    table = {}
     for entry in words:
         fix = None
         if isinstance(entry, dict):
@@ -295,27 +363,61 @@ def _build_wordlist(rule, what):
             word = entry
         if not isinstance(word, str):
             raise PackError("%s: every word must be a string or {\"word\": ..., \"fix\": ...}" % what)
-        key = _word_key(word)
+        key = _word_tokens(word)
         if not key or len(word) > MAX_WORD_LEN:
             raise PackError("%s: every word must have 1-%d characters" % (what, MAX_WORD_LEN))
-        if key not in fixes:
-            keys.append(key)
-        fixes[key] = fix
-    prefixes = _string_list(rule, "prefixes", what, 10, 8)
-    keys.sort(key=len, reverse=True)
-    body = "|".join(_word_regex(k) for k in keys)
-    prefix = ""
-    if prefixes:
-        alts = sorted((_word_regex(_strip_marks(p)) for p in prefixes if _strip_marks(p).strip()),
-                      key=len, reverse=True)
-        if alts:
-            prefix = "(?:" + "|".join(alts) + ")?"
-    pattern = "(?<!" + BOUNDARY_CLASS + ")" + prefix + "(?P<w>" + body + ")(?!" + BOUNDARY_CLASS + ")"
-    compiled = re.compile(pattern, re.IGNORECASE)
+        table[key] = fix
+    prefixes = []
+    for item in _string_list(rule, "prefixes", what, 10, 8):
+        norm = _prep(item.strip())[0]
+        if norm and not any(c.isspace() for c in norm) and norm not in prefixes:
+            prefixes.append(norm)
+    # One or two stacked prefixes (waw + alef-lam); the shortest strip is tried first.
+    combos = list(prefixes) + [a + b for a in prefixes for b in prefixes]
+    combos = sorted(set(combos), key=len)
+    first_tokens = set(key[0] for key in table)
+    lengths = sorted(set(len(key) for key in table), reverse=True)
+
+    def find(toks, i):
+        """The longest word at token i, or None. Returns (key, token_count)."""
+        tok = toks[i]
+        candidates = [(tok, 0)] if tok in first_tokens else []
+        if combos and _is_word_char(tok[0]):
+            for combo in combos:
+                if len(tok) > len(combo) and tok.startswith(combo) and tok[len(combo):] in first_tokens:
+                    candidates.append((tok[len(combo):], 1))
+        for first, _stripped in candidates:
+            for length in lengths:
+                key = (first,) + tuple(toks[i + 1:i + length])
+                if len(key) == length and key in table:
+                    return key, length
+        return None
 
     def matcher(text):
-        for m in compiled.finditer(text):
-            yield m.start(), m.end(), fixes.get(_word_key(m.group("w"))), None
+        norm, starts, ends, toks, tstarts, tends = _prep(text)
+        count = len(toks)
+        i = 0
+        while i < count:
+            if toks[i] == " ":
+                i += 1
+                continue
+            hit = find(toks, i)
+            if hit is None:
+                i += 1
+                continue
+            key, length = hit
+            first = tstarts[i]
+            last = tends[i + length - 1]
+            before = norm[first - 1] if first > 0 else " "
+            after = norm[last] if last < len(norm) else " "
+            if _is_word_char(before) or _is_word_char(after):
+                i += 1
+                continue
+            end = ends[last - 1]
+            while end < len(text) and MARKS_RE.match(text[end]):
+                end += 1
+            yield starts[first], end, table[key], None
+            i += length
     return matcher
 
 
@@ -377,7 +479,7 @@ def _build_rule(rule, index, seen):
     if not isinstance(rule, dict):
         raise PackError("%s: must be an object" % what)
     rule_id = rule.get("id")
-    if not isinstance(rule_id, str) or not NAME_RE.match(rule_id):
+    if not isinstance(rule_id, str) or not NAME_RE.match(rule_id):  # NAME_RE ends with \Z
         raise PackError("%s: \"id\" must be lowercase letters, digits, - or _ (max 64)" % what)
     what = "rule \"%s\"" % rule_id
     if rule_id in seen:
@@ -461,8 +563,15 @@ def effective_scope(pack, force=None):
 
 
 def scope_info(scope):
+    pattern = scope["tag_pattern"] if scope["mode"] == "tagged" else None
     return {"mode": scope["mode"],
-            "tag_pattern": scope["tag_pattern"] if scope["mode"] == "tagged" else None}
+            "tag_pattern": sanitize(pattern, 300) if pattern is not None else None}
+
+
+def valid_pack_name(name):
+    """A pack id / pack file stem: lowercase letters, digits, - and _, not a Windows device name."""
+    return (isinstance(name, str) and NAME_RE.match(name) is not None
+            and name.split(".")[0].upper() not in RESERVED_NAMES)
 
 
 def validate_pack(data, expected_id=None):
@@ -475,11 +584,12 @@ def validate_pack(data, expected_id=None):
         if key not in PACK_KEYS:
             raise PackError("unknown top-level key \"%s\"" % sanitize(key, 40))
     pack_id = data.get("id")
-    if not isinstance(pack_id, str) or not NAME_RE.match(pack_id):
-        raise PackError("\"id\" must be lowercase letters, digits, - or _ (max 64)")
+    if not valid_pack_name(pack_id):
+        raise PackError("\"id\" must be lowercase letters, digits, - or _ (max 64) "
+                        "and not a reserved name like con, nul, aux")
     if expected_id is not None and pack_id != expected_id:
         raise PackError("\"id\" is \"%s\" but the file name says \"%s\"; they must match"
-                        % (pack_id, expected_id))
+                        % (pack_id, sanitize(expected_id, 64)))
     label = _text_field(data, "label", "pack", limit=100)
     description = _text_field(data, "description", "pack", required=False)
     line_filter = None
@@ -523,12 +633,14 @@ def builtin_pack_dir():
 
 
 def find_pack(name, pack_dir=None):
-    if not isinstance(name, str) or not NAME_RE.match(name):
-        raise PackError("pack name must be lowercase letters, digits, - or _ (no paths)")
+    if not valid_pack_name(name):
+        raise PackError("pack name must be lowercase letters, digits, - or _ (no paths, no reserved names)")
     folders = ([pack_dir] if pack_dir else []) + [builtin_pack_dir()]
     for folder in folders:
         path = os.path.join(folder, name + ".json")
-        if os.path.isfile(path):
+        # Compare the exact file name, so a case-insensitive file system (Windows, macOS) does not
+        # load Saudi.JSON for "saudi"; --list-packs applies the same rule.
+        if _listing_has(folder, name + ".json") and os.path.isfile(path):
             try:
                 return load_pack_file(path, name)
             except PackError as exc:
@@ -536,10 +648,21 @@ def find_pack(name, pack_dir=None):
     raise PackError("pack \"%s\" not found; use --list-packs to see what is available" % name)
 
 
-def list_packs(pack_dir=None):
-    """Return a list of {id, source, valid, label, rules, error} for every pack file found."""
+def _listing_has(folder, file_name):
+    try:
+        return file_name in os.listdir(folder)
+    except OSError:
+        return False
+
+
+def list_packs(pack_dir=None, info=None):
+    """Return a list of {id, source, valid, label, rules, error} for every pack file found.
+
+    info, when given, receives "skipped": how many pack files were not listed because of the cap.
+    """
     rows = []
     seen = set()
+    skipped = 0
     sources = ([("custom", pack_dir)] if pack_dir else []) + [("builtin", builtin_pack_dir())]
     for source, folder in sources:
         try:
@@ -547,18 +670,24 @@ def list_packs(pack_dir=None):
         except OSError as exc:
             raise ToolError("cannot read the pack folder %s (%s)"
                             % (show_path(folder), sanitize(exc.strerror or exc, 80)))
+        skipped += max(0, len(names) - MAX_PACKS_LISTED)
         for file_name in names[:MAX_PACKS_LISTED]:
             stem = file_name[:-5]
             row = {"id": sanitize(stem, 64), "source": source, "valid": False,
                    "label": None, "rules": 0, "scope": None, "error": None, "shadowed": stem in seen}
             try:
+                if file_name != stem + ".json" or not valid_pack_name(stem):
+                    raise PackError("the file name must be <id>.json with a lowercase id "
+                                    "(letters, digits, - and _), so --pack can load it")
                 pack = load_pack_file(os.path.join(folder, file_name), stem)
                 row.update(valid=True, label=pack["label"], rules=len(pack["rules"]),
                            scope=scope_info(effective_scope(pack)))
             except PackError as exc:
-                row["error"] = str(exc)
+                row["error"] = sanitize(exc, 500)
             seen.add(stem)
             rows.append(row)
+    if info is not None:
+        info["skipped"] = skipped
     return rows
 
 
@@ -601,48 +730,73 @@ def _snippet(segment, start, end):
     return sanitize(segment[start:end], SNIPPET_CHARS)
 
 
-def lint_text(text, pack, line_filter=None, scope=None):
+def _tag_end(tag_regex, probe):
+    """Column where the tag ends, or None. Invisible characters (RLM, ZWSP, BOM, NBSP...) in front of the tag are tolerated."""
+    m = tag_regex.search(probe)
+    if m is not None:
+        return m.end()
+    lead = LEADING_INVISIBLE_RE.match(probe)
+    if lead is not None:
+        m = tag_regex.search(probe[lead.end():])
+        if m is not None:
+            return lead.end() + m.end()
+    return None
+
+
+def lint_text(text, pack, line_filter=None, scope=None, progress=None, stats=None):
     """Lint decoded text. Returns (findings, lines_checked). Columns are 1-based code points.
 
     scope is a dict from effective_scope(); None means the pack's own scope. In tagged mode only
     lines where the tag regex matches are linted, and the matched tag itself is hidden from the rules.
+    progress, when given, is called with each rule id before that rule runs over the file (the worker
+    uses it to say which rule was running if a time limit hits). stats, when given, receives
+    "skipped_untagged": the number of non-empty lines skipped because they have no tag.
+
+    The line filter and the scope are applied once, then each rule runs over the kept lines.
     """
-    findings = []
     checked = 0
-    capped_at = 0
+    skipped = 0
     active_filter = line_filter if line_filter is not None else pack["line_filter"]
     pack_id = pack["id"]
     tag_regex = (scope if scope is not None else effective_scope(pack))["tag_regex"]
+    items = []
+    findings = []
     for number, line in enumerate(NEWLINE_RE.split(text), 1):
-        start, end = 0, len(line)
         too_long = len(line) > MAX_LINE_CHARS
+        probe = line[:MAX_LINE_CHARS] if too_long else line
+        start, end = 0, len(line)
         if active_filter is not None:
-            if too_long:
-                m = None
-            else:
-                m = active_filter.search(line)
-                if m is None:
-                    continue
-            if m is not None and active_filter.groups >= 1 and m.group(1) is not None:
+            m = active_filter.search(probe)
+            if m is None:
+                continue
+            if active_filter.groups >= 1 and m.group(1) is not None:
                 start, end = m.start(1), m.end(1)
         if tag_regex is not None:
-            tag = tag_regex.search(line[:MAX_LINE_CHARS] if too_long else line)
-            if tag is None:
+            tag_end = _tag_end(tag_regex, probe)
+            if tag_end is None:
+                if line.strip():
+                    skipped += 1
                 continue
-            start = max(start, tag.end())
+            start = max(start, tag_end)
             end = max(end, start)
-        offset = start
         segment = line[start:end]
         if not segment.strip():
             continue
         checked += 1
-        if len(line) > MAX_LINE_CHARS:
+        if too_long:
             findings.append({"line": number, "col": 1, "rule": "lahja/long-line", "severity": "warn",
                              "message": "line has more than %d characters and was not checked; "
                                         "break it into shorter lines" % MAX_LINE_CHARS,
                              "text": sanitize(line[:SNIPPET_CHARS], SNIPPET_CHARS), "fix": None})
             continue
-        for rule in pack["rules"]:
+        items.append((number, start, segment))
+    if stats is not None:
+        stats["skipped_untagged"] = skipped
+    for rule in pack["rules"]:
+        if progress is not None:
+            progress(rule["id"])
+        got = 0
+        for number, offset, segment in items:
             target = _mask(segment, rule["ignore_inside"]) if rule["ignore_inside"] else segment
             allowed = _allowed_spans(segment, rule["allow"]) if rule["allow"] else []
             for start, end, word_fix, detail in rule["matcher"](target):
@@ -656,26 +810,43 @@ def lint_text(text, pack, line_filter=None, scope=None):
                                  "message": message,
                                  "text": _snippet(segment, start, end),
                                  "fix": word_fix or rule["fix"]})
-                if len(findings) >= MAX_FINDINGS_PER_FILE:
+                got += 1
+                if got >= MAX_FINDINGS_PER_FILE:
                     break
-            if len(findings) >= MAX_FINDINGS_PER_FILE:
+            if got >= MAX_FINDINGS_PER_FILE:
                 break
-        if len(findings) >= MAX_FINDINGS_PER_FILE:
-            capped_at = number
-            break
+    # Each rule keeps at most its first MAX findings, so the first MAX of all of them are all here.
     findings.sort(key=lambda f: (f["line"], f["col"]))
-    if capped_at:
-        findings.append({"line": capped_at, "col": 1, "rule": "lahja/too-many-findings",
+    if len(findings) >= MAX_FINDINGS_PER_FILE:
+        findings = findings[:MAX_FINDINGS_PER_FILE]
+        findings.append({"line": findings[-1]["line"], "col": 1, "rule": "lahja/too-many-findings",
                          "severity": "warn",
                          "message": "stopped after %d findings in this file" % MAX_FINDINGS_PER_FILE,
                          "text": "", "fix": None})
     return findings, checked
 
 
+def is_device_name(path):
+    """True for Windows device names (CON, NUL, AUX, COM1, CON.txt, \\\\.\\pipe\\x ...): reading one can block."""
+    norm = str(path).replace("\\", "/")
+    if norm.startswith("//./"):
+        return True
+    base = norm.rsplit("/", 1)[-1]
+    return base.split(".")[0].rstrip(" ").upper() in RESERVED_NAMES
+
+
 def read_script(path):
     """Read a script file as text (UTF-8, BOM tolerated). Raises ToolError."""
-    if os.path.isdir(path):
+    if is_device_name(path):
+        raise ToolError("is a device name (CON, NUL, COM1 ...), not a script file")
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as exc:
+        raise ToolError("cannot read the file (%s)" % sanitize(exc.strerror or exc, 80))
+    if stat.S_ISDIR(mode):
         raise ToolError("is a folder, not a file")
+    if not stat.S_ISREG(mode):
+        raise ToolError("is not a regular file (device or pipe)")
     try:
         with open(path, "rb") as handle:
             raw = handle.read(MAX_FILE_BYTES + 1)
@@ -737,11 +908,184 @@ def _fail(message):
     sys.stderr.write("lahja: error: %s\n" % message)
 
 
-def _run_list(args):
-    rows = list_packs(args.pack_dir)
+# ---------------------------------------------------------------- worker process
+#
+# The real work runs in a child process ("worker") so that a slow regex can be stopped, and so that
+# the results of the files already linted survive a time limit. The worker prints one JSON record
+# per line (ASCII only) and flushes after each; the parent turns the records into the final output.
+# The worker also arms its own deadline (faulthandler runs in a C thread, so it fires even while a
+# regex holds the interpreter), which ends it without help if the parent is gone.
+
+_WATCH_FILE = []
+
+
+def _arm_watchdog(seconds):
+    """End this process with exit code 1 after `seconds`, even inside a long regex match."""
+    try:
+        if not _WATCH_FILE:
+            _WATCH_FILE.append(open(os.devnull, "w"))
+        faulthandler.dump_traceback_later(seconds, repeat=False, file=_WATCH_FILE[0], exit=True)
+    except (OSError, ValueError, RuntimeError, AttributeError, OverflowError) as exc:
+        raise ToolError("cannot start the time limit (%s); refusing to run without one"
+                        % sanitize(exc, 80))
+
+
+def _emit(record):
+    sys.stdout.write(json.dumps(record) + "\n")
+    sys.stdout.flush()
+
+
+def _worker_list(args):
+    info = {}
+    rows = list_packs(args.pack_dir, info)
+    _emit({"t": "packs", "rows": rows, "skipped": info.get("skipped", 0)})
+    _emit({"t": "end"})
+    return 0
+
+
+def _worker_lint(args):
+    if not args.files:
+        raise ToolError("no files given (see --help)")
+    if len(args.files) > MAX_FILES:
+        raise ToolError("more than %d files in one run" % MAX_FILES)
+    pack = find_pack(args.pack, args.pack_dir)
+    cli_filter = None
+    if args.line_filter is not None:
+        cli_filter = compile_guarded(args.line_filter, "--line-filter")
+    force = "all" if args.all_lines else ("tagged" if args.tagged_only else None)
+    scope = effective_scope(pack, force)
+    _emit({"t": "header", "pack": pack["id"], "scope": scope_info(scope), "files": len(args.files)})
+    for path in args.files:
+        shown = show_path(path)
+        _emit({"t": "stage", "file": shown, "rule": None})
+        try:
+            text = read_script(path)
+        except ToolError as exc:
+            _emit({"t": "file", "file": shown, "tool_error": str(exc)})
+            continue
+        stats = {}
+
+        def progress(rule_id, shown=shown):
+            _emit({"t": "stage", "file": shown, "rule": pack["id"] + "/" + rule_id})
+
+        findings, checked = lint_text(text, pack, cli_filter, scope, progress, stats)
+        _emit({"t": "file", "file": shown, "findings": findings, "checked": checked,
+               "skipped": stats.get("skipped_untagged", 0)})
+    _emit({"t": "end"})
+    return 0
+
+
+def _worker(args):
+    try:
+        if args.pack_dir is not None and not os.path.isdir(args.pack_dir):
+            raise ToolError("--pack-dir is not a folder: %s" % show_path(args.pack_dir))
+        if args.list_packs:
+            return _worker_list(args)
+        return _worker_lint(args)
+    except (PackError, ToolError) as exc:
+        _fail(str(exc))
+    except RecursionError:
+        _fail("input is nested too deeply")
+    except MemoryError:
+        _fail("out of memory")
+    _emit({"t": "fatal"})
+    return 1
+
+
+def _worker_entry():
+    """Entry point of the child process. Refuses to run unless the parent started it."""
+    expected = os.environ.get(TOKEN_ENV)
+    if not expected:
+        _fail("--_worker is internal and cannot be used directly")
+        return 1
+    try:
+        _arm_watchdog(10.0)  # for reading the work order
+        raw = sys.stdin.buffer.read(MAX_PAYLOAD + 1)
+        if len(raw) > MAX_PAYLOAD:
+            raise ValueError("work order too large")
+        order = json.loads(raw.decode("utf-8"))
+        token = order["token"]
+        argv = order["argv"]
+        if (not isinstance(token, str) or not isinstance(argv, list)
+                or not all(isinstance(a, str) for a in argv)):
+            raise ValueError("bad work order")
+    except ToolError as exc:
+        _fail(str(exc))
+        return 1
+    except (ValueError, KeyError, TypeError, OSError):
+        _fail("--_worker is internal and cannot be used directly")
+        return 1
+    if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+        _fail("--_worker is internal and cannot be used directly")
+        return 1
+    args = build_parser().parse_args(argv)
+    if args._worker or not (1 <= args.timeout <= 600):
+        _fail("bad work order")
+        return 1
+    try:
+        _arm_watchdog(args.timeout + WORKER_GRACE)
+    except ToolError as exc:
+        _fail(str(exc))
+        return 1
+    return _worker(args)
+
+
+# ---------------------------------------------------------------- parent process
+
+def _read_events(stream, events):
+    try:
+        for raw in iter(stream.readline, b""):
+            try:
+                record = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                events.append(record)
+    except (OSError, ValueError):
+        pass
+
+
+def _supervise(argv, timeout):
+    """Run the worker with a hard time limit. Returns (events, returncode, timed_out)."""
+    if not sys.executable:
+        raise ToolError("cannot find the Python program to start the checking process; "
+                        "nothing was checked")
+    token = os.urandom(16).hex()
+    env = dict(os.environ)
+    env[TOKEN_ENV] = token
+    order = json.dumps({"token": token, "argv": argv}).encode("ascii")
+    command = [sys.executable, "-X", "utf8", os.path.abspath(__file__), "--_worker"]
+    try:
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+    except OSError as exc:
+        raise ToolError("cannot start the checking process (%s); nothing was checked"
+                        % sanitize(exc.strerror or exc, 80))
+    events = []
+    reader = threading.Thread(target=_read_events, args=(proc.stdout, events))
+    reader.daemon = True
+    reader.start()
+    try:
+        proc.stdin.write(order)
+        proc.stdin.close()
+    except OSError:
+        pass
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    reader.join(5)
+    return list(events), proc.returncode, timed_out
+
+
+def _print_packs(args, record):
+    rows = record["rows"]
+    skipped = record.get("skipped", 0)
     bad = [r for r in rows if not r["valid"]]
     if args.format == "json":
-        print(json.dumps({"tool": "lahja", "version": VERSION, "packs": rows},
+        print(json.dumps({"tool": "lahja", "version": VERSION, "packs": rows, "skipped": skipped},
                          ensure_ascii=False, indent=2))
     else:
         for row in rows:
@@ -753,45 +1097,76 @@ def _run_list(args):
                       % (row["id"], row["source"], row["rules"], sanitize(shown, 100), row["label"], note))
             else:
                 print("%s\t%s\tINVALID: %s" % (row["id"], row["source"], row["error"]))
+        if skipped:
+            print("lahja: %d more pack file(s) not listed (limit %d per folder)"
+                  % (skipped, MAX_PACKS_LISTED))
     return 1 if bad else 0
 
 
-def _run_lint(args):
-    if not args.files:
-        raise ToolError("no files given (see --help)")
-    if len(args.files) > MAX_FILES:
-        raise ToolError("more than %d files in one run" % MAX_FILES)
-    pack = find_pack(args.pack, args.pack_dir)
-    cli_filter = None
-    if args.line_filter is not None:
-        cli_filter = compile_guarded(args.line_filter, "--line-filter")
-    force = "all" if args.all_lines else ("tagged" if args.tagged_only else None)
-    scope = effective_scope(pack, force)
-    all_findings = []
-    tool_errors = []
-    notes = []
-    for path in args.files:
-        shown = show_path(path)
-        try:
-            text = read_script(path)
-        except ToolError as exc:
-            tool_errors.append({"file": shown, "message": str(exc)})
+def _interruption(args, header, stage, done, timed_out, returncode):
+    if timed_out:
+        what = "stopped after %g seconds" % args.timeout
+        hint = "a pack regex is too slow for this input, or the input is too large"
+    else:
+        what = "the checking process stopped unexpectedly (exit code %s)" % returncode
+        hint = "no further detail"
+    if header is None:
+        where = "while loading the pack"
+    elif stage is None:
+        where = "before the first file"
+    elif stage.get("rule"):
+        where = "while checking %s with rule %s" % (stage["file"], stage["rule"])
+    else:
+        where = "while reading %s" % stage["file"]
+    total = len(args.files)
+    tail = ""
+    if header is not None:
+        tail = "; %d of %d file(s) were already checked and their findings are kept" % (done, total)
+    message = "%s %s (%s)%s" % (what, where, hint, tail)
+    return (stage["file"] if stage else "-"), message
+
+
+def _print_lint(args, events, returncode, timed_out):
+    header = stage = None
+    results = []
+    ended = False
+    for record in events:
+        kind = record.get("t")
+        if kind == "header":
+            header = record
+        elif kind == "stage":
+            stage = record
+        elif kind == "file":
+            results.append(record)
+        elif kind == "end":
+            ended = True
+    all_findings, tool_errors, notes = [], [], []
+    skipped = 0
+    for res in results:
+        if res.get("tool_error") is not None:
+            tool_errors.append({"file": res["file"], "message": res["tool_error"]})
             continue
-        findings, checked = lint_text(text, pack, cli_filter, scope)
-        if checked == 0:
-            notes.append({"file": shown, "message": "no lines were checked (empty file, or nothing "
-                                                    "matched the line filter or the scope)"})
-        for finding in findings:
-            finding["file"] = shown
+        if res["checked"] == 0:
+            notes.append({"file": res["file"], "message": "no lines were checked (empty file, or nothing "
+                                                          "matched the line filter or the scope)"})
+        skipped += res.get("skipped", 0)
+        for finding in res["findings"]:
+            finding["file"] = res["file"]
             all_findings.append(finding)
+    if not ended:
+        file_name, message = _interruption(args, header, stage, len(results), timed_out, returncode)
+        tool_errors.append({"file": file_name, "message": message})
     errors = sum(1 for f in all_findings if f["severity"] == "error")
     warns = len(all_findings) - errors
+    skipped_note = "%d untagged line(s) skipped (use --all-lines)" % skipped if skipped else None
+    pack_id = header["pack"] if header else sanitize(args.pack, 64)
     if args.format == "json":
         ordered = [{"file": f["file"], "line": f["line"], "col": f["col"], "rule": f["rule"],
                     "severity": f["severity"], "message": f["message"], "text": f["text"],
                     "fix": f["fix"]} for f in all_findings]
-        print(json.dumps({"tool": "lahja", "version": VERSION, "pack": pack["id"],
-                          "scope": scope_info(scope),
+        print(json.dumps({"tool": "lahja", "version": VERSION, "pack": pack_id,
+                          "scope": header["scope"] if header else None,
+                          "untagged_skipped": skipped, "scope_note": skipped_note, "complete": ended,
                           "findings": ordered, "tool_errors": tool_errors, "notes": notes,
                           "summary": {"files": len(args.files), "error": errors, "warn": warns,
                                       "tool_errors": len(tool_errors)}},
@@ -807,53 +1182,46 @@ def _run_lint(args):
             print(line)
         for note in notes:
             print("%s: note: %s" % (note["file"], note["message"]))
+        if skipped_note:
+            print("lahja: %s" % skipped_note)
         print("lahja: %d error, %d warn in %d file(s), pack %s"
-              % (errors, warns, len(args.files), pack["id"]))
+              % (errors, warns, len(args.files), pack_id))
     for item in tool_errors:
-        _fail("%s: %s" % (item["file"], item["message"]))
+        _fail("%s: %s" % (item["file"], item["message"]) if not item["message"].startswith(
+            ("stopped after", "the checking process")) else item["message"])
     if tool_errors:
         return 1
     return 2 if errors else 0
 
 
-def _worker(args):
-    try:
-        if args.pack_dir is not None and not os.path.isdir(args.pack_dir):
-            raise ToolError("--pack-dir is not a folder: %s" % show_path(args.pack_dir))
-        if args.list_packs:
-            return _run_list(args)
-        return _run_lint(args)
-    except (PackError, ToolError) as exc:
-        _fail(str(exc))
+def _run_parent(argv, args):
+    events, returncode, timed_out = _supervise(argv, args.timeout)
+    if any(r.get("t") == "fatal" for r in events):
+        return 1  # the worker already printed the message
+    if args.list_packs:
+        for record in events:
+            if record.get("t") == "packs":
+                return _print_packs(args, record)
+        _, message = _interruption(args, None, None, 0, timed_out, returncode)
+        _fail(message)
         return 1
-    except RecursionError:
-        _fail("input is nested too deeply")
-        return 1
-    except MemoryError:
-        _fail("out of memory")
-        return 1
+    return _print_lint(args, events, returncode, timed_out)
 
 
 def main(argv=None):
     _setup_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
+    if args._worker:
+        return _worker_entry()
     if not (1 <= args.timeout <= 600):
         _fail("--timeout must be between 1 and 600 seconds")
         return 1
-    if args._worker or not sys.executable:
-        return _worker(args)
-    # Watchdog: the real work runs in a child process so a slow regex can be stopped.
-    command = [sys.executable, "-X", "utf8", os.path.abspath(__file__), "--_worker"] + argv
     try:
-        done = subprocess.run(command, stdin=subprocess.DEVNULL, timeout=args.timeout)
-    except subprocess.TimeoutExpired:
-        _fail("stopped after %g seconds (a pack regex is too slow for this input, "
-              "or the input is too large)" % args.timeout)
+        return _run_parent(argv, args)
+    except ToolError as exc:
+        _fail(str(exc))
         return 1
-    except OSError:
-        return _worker(args)
-    return done.returncode if done.returncode in (0, 1, 2) else 1
 
 
 if __name__ == "__main__":

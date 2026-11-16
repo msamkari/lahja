@@ -1,4 +1,4 @@
-# lahja — a Claude Code plugin (v0.1.1)
+# lahja — a Claude Code plugin (v0.1.2)
 
 `lahja` (Arabic for "dialect") is a linter for scripts that are meant to be **spoken**: voiceovers, reels, podcasts. Written text that looks fine can sound wrong when read aloud or when a text-to-speech engine reads it: formal words nobody says, digits, stray Latin letters, tanween, doubled punctuation, sentences too long for one breath. `lahja` finds these and tells you the file, line and column. It never rewrites anything.
 
@@ -29,7 +29,8 @@ lahja: 1 error, 0 warn in 1 file(s), pack saudi
 - Put `--` before file names so a name that starts with a dash is not read as an option.
 - `--line-filter REGEX` lints only the lines that match. If the regex has a group, only group 1 is linted. Example for scripts where spoken lines start with a tag such as `[calm]`: `--line-filter '^\s*\[[a-z ]+\]\s*(.*)$'`. Without a filter every non-empty line is linted, including headings. A line filter combines with the pack scope (below): a line must pass both.
 - `--all-lines` lints every non-empty line, ignoring the pack's scope, for this run. `--tagged-only` lints only lines that start with a `[tag]`, even if the pack says all lines (it uses the pack's `tag_pattern`, or `^\s*\[[^\]]+\]` when the pack has none). The two flags cannot be combined. The text after the tag is what the rules see, so a tag such as `[intro]` is never flagged, and columns still count from the start of the original line.
-- `--list-packs` shows each pack's scope; `--format json` output has a `"scope": {"mode", "tag_pattern"}` field that tells which scope the run used.
+- When tagged scope skips lines, the summary says `N untagged line(s) skipped (use --all-lines)` and the JSON has `untagged_skipped` and `scope_note`. A tag after an invisible mark (RLM, ZWSP, BOM, NBSP) still counts. Device names such as CON or NUL are refused as input.
+- `--list-packs` shows each pack's scope and says how many pack files it did not list (limit 200 per folder); `--format json` output has a `"scope": {"mode", "tag_pattern"}` field that tells which scope the run used.
 - Files must be UTF-8 text of at most 2 MB. Lines longer than 2000 characters are reported and not scanned.
 
 ## Dialect packs
@@ -78,20 +79,20 @@ The optional `scope` says which lines a pack lints. `{"mode": "all"}` (the defau
 Keys that start with `_` are ignored, so you can leave comments. Any other unknown key is an error, to catch typos. Limits: pack file 256 KB, 200 rules, 500 words per rule.
 
 ### Regex safety
-Python's standard library has no regex timeout, so a pack regex is checked before use and refused when it: repeats a group that itself contains a repeat, an optional part or an alternation (`(a+)+`, `(a|ab)*`, `(a?){30}`), uses the inline verbose flag `x`, uses a backreference or a conditional, is longer than 300 characters, has a repeat count above 1000 or more than six unbounded repeats, or can match empty text. This guard is a heuristic: it refuses some harmless patterns (write `(?:foo|bar)+` as two rules or without the repeat) and cannot catch every slow one. As a second line of defence the real work runs in a child process that is stopped after `--timeout` seconds (default 30); the run then ends with exit code 1.
+Python's standard library has no regex timeout, so a pack regex is checked before use and refused when it: repeats a group that itself contains a repeat, an optional part or an alternation (`(a+)+`, `(a|ab)*`, `(a?){30}`), uses the inline verbose flag `x`, uses a backreference or a conditional, is longer than 300 characters, has a repeat count above 1000 or more than six unbounded repeats, or can match empty text. It also refuses more than 6 optional parts, more than 4 unbounded or large repeats, and more than 2 in a row (`.*.*.*`). This guard is a heuristic: it refuses some harmless patterns (write `(?:foo|bar)+` as two rules or without the repeat) and cannot catch every slow one. The real guard is the time limit: the work runs in a child process that is stopped after `--timeout` seconds (default 30) and that also ends by itself shortly after the limit if the parent is gone. On a timeout the findings of the files already linted are still printed, the error names the file and rule that was running, and the exit code is 1. The child cannot be started by hand (`--_worker` is internal).
 
 ### The Saudi pack
 `packs/saudi.json` uses tagged scope: only lines that start with a `[tag]` are linted (use `--all-lines` for plain text). It targets everyday Saudi "white" dialect (Gulf, Najdi-leaning) for voiceover. Errors: tanween, Latin letters outside `«…»` and `[...]`, digits, and formal particles (ماذا، لماذا، سوف، الذي، التي، الذين، هكذا، لكي). Warnings: formal words with a dialect alternative (الآن ← الحين، يجب ← لازم، أريد ← أبي …), formal plurals, a vowel mark on a final kaf, symbols and punctuation that speech engines misread, tatweel, and sentences over 25 words. It is one speaker's taste, not a standard: copy it under a new id and change it.
 
 ## Safety and privacy
 - Read-only: the script opens files for reading only and never writes, deletes or renames anything.
-- No network, no keys, no environment variables, no telemetry. Your scripts stay on your machine.
+- No network, no keys, no telemetry. The only environment variable it touches is a one-time token it sets for its own child process. Your scripts stay on your machine.
 - Script text, file names and pack messages are printed with control and bidirectional-override characters removed, and matched text is cut to 60 characters.
 - In the skills, Claude is told to treat script text as data, to show findings first, and to edit a file only after you approve. Creating a pack writes only the one file you choose.
 
 ## Limits
 - It matches text, not grammar: it cannot tell a formal word from the same letters used as a name or inside a quotation. That is why most word rules are warnings.
-- No spelling normalisation beyond diacritics (for example different hamza spellings of one word are different words).
+- Normalisation is limited to diacritics, tatweel and decomposed hamza/madda; other spelling variants (for example hamza-less forms) are different words, so the Saudi pack lists some of them explicitly.
 - Verb conjugations are matched only in the forms listed in a pack.
 
 ## Development

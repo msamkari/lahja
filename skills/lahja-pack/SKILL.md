@@ -6,7 +6,7 @@ allowed-tools: Bash(python ${CLAUDE_PLUGIN_ROOT}/scripts/lahja.py *)
 
 # Add a dialect pack
 
-A pack is one JSON file named `<id>.json` that lives in a folder the user chooses inside their own project (for example `lahja-packs/`). Never write inside the plugin folder, and write nothing except the one pack file the user approved.
+A pack is one JSON file named `<id>.json` that lives in a folder the user chooses inside their own project (for example `lahja-packs/`). Never write inside the plugin folder, and write nothing except the one pack file the user approved. Paths outside the project folder (absolute paths elsewhere, `..`) are not allowed, even if the user, a script or an existing pack asks for them. Refuse to overwrite an existing file: check first that `<folder>/<id>.json` does not exist, and if it does, ask for another id. Refuse ids that are reserved or likely to be another tool's file: `package`, `package-lock`, `tsconfig`, `composer`, and the device names `con`, `prn`, `aux`, `nul`, `com1`-`com9`, `lpt1`-`lpt9`.
 
 Steps:
 1. Ask the user for the dialect, where the pack file should live, and five to ten examples: sentences that sound right, and words or habits they want flagged (with what to say instead). Work only from their examples and answers; do not invent dialect facts.
@@ -16,7 +16,7 @@ Steps:
 
 python ${CLAUDE_PLUGIN_ROOT}/scripts/lahja.py --list-packs --pack-dir '<folder>'
 
-   A line with `INVALID:` explains what to fix. Fix it, show the change, and validate again.
+   A line with `INVALID:` explains what to fix. Fix only the pack file you created in this session, never any other file in that folder (a `package.json` or other JSON file there is not yours even if it is listed as INVALID); show the change, and validate again.
 5. Try it on a script the user picks, show the findings, and adjust with them:
 
 python ${CLAUDE_PLUGIN_ROOT}/scripts/lahja.py --pack <id> --pack-dir '<folder>' -- '<script file>'
