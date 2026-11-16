@@ -2,6 +2,8 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+- Icon added (square 1024 px PNG, generated with Gemini and chosen by the author).
+
 ## [0.1.0] (2026-11-15)
 - First version: one standard-library Python script, `scripts/lahja.py`, that lints spoken-word scripts against a dialect pack and reports `file:line:col`. Read-only, no network.
 - Rule kinds: `regex`, `wordlist` (whole words, diacritics ignored, optional prefixes and per-word fix), `numeral`, `latin`, `length`; optional `allow` and `ignore_inside` on every rule; optional line filter in the pack or on the command line.
