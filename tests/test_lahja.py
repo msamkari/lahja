@@ -379,34 +379,34 @@ class PositionTests(unittest.TestCase):
 class CliTests(TempDirCase):
     def test_clean_file_exits_zero(self):
         path = self.write("ok.txt", "الجو اليوم حلو مرّة.\nبروح السوق بعدين.\n")
-        code, out, err = run_cli(["--", path])
+        code, out, err = run_cli(["--all-lines", "--", path])
         self.assertEqual((code, err), (0, ""))
         self.assertIn("0 error, 0 warn", out)
 
     def test_error_findings_exit_two_with_file_line_col(self):
         path = self.write("bad.txt", "الجو حلو.\nسوف أشتري 3 كتب.\n")
-        code, out, err = run_cli(["--", path])
+        code, out, err = run_cli(["--all-lines", "--", path])
         self.assertEqual(code, 2)
         self.assertIn("bad.txt:2:1: error saudi/formal-particles:", out)
         self.assertIn("bad.txt:2:11: error saudi/numerals:", out)
 
     def test_warnings_only_exit_zero(self):
         path = self.write("warn.txt", "أريد قهوة.\n")
-        code, out, err = run_cli(["--", path])
+        code, out, err = run_cli(["--all-lines", "--", path])
         self.assertEqual(code, 0)
         self.assertIn("warn saudi/formal-words", out)
         self.assertIn("fix: أبي / أبغى", out)
 
     def test_bom_and_crlf_do_not_shift_positions(self):
         path = self.write("bom.txt", b"\xef\xbb\xbf" + "سوف نروح.\r\nعندي 5.\r\n".encode("utf-8"))
-        code, out, err = run_cli(["--format", "json", "--", path])
+        code, out, err = run_cli(["--all-lines", "--format", "json", "--", path])
         data = json.loads(out)
         self.assertEqual(code, 2)
         self.assertEqual([(f["line"], f["col"]) for f in data["findings"]], [(1, 1), (2, 6)])
 
     def test_json_output_shape(self):
         path = self.write("j.txt", "اشتريت 2 قلم\n")
-        code, out, err = run_cli(["--format", "json", "--", path])
+        code, out, err = run_cli(["--all-lines", "--format", "json", "--", path])
         data = json.loads(out)
         self.assertEqual(data["pack"], "saudi")
         self.assertEqual(data["summary"], {"files": 1, "error": 1, "warn": 0, "tool_errors": 0})
@@ -421,7 +421,7 @@ class CliTests(TempDirCase):
 
     def test_tool_error_wins_over_findings_but_findings_still_print(self):
         path = self.write("bad.txt", "عندي 5\n")
-        code, out, err = run_cli(["--", path, self.dir + "/nope.txt"])
+        code, out, err = run_cli(["--all-lines", "--", path, self.dir + "/nope.txt"])
         self.assertEqual(code, 1)
         self.assertIn("saudi/numerals", out)
 
@@ -436,27 +436,27 @@ class CliTests(TempDirCase):
 
     def test_oversize_file_is_refused(self):
         path = self.write("huge.txt", b"a\n" * (lahja.MAX_FILE_BYTES // 2 + 1))
-        code, out, err = run_cli(["--", path])
+        code, out, err = run_cli(["--all-lines", "--", path])
         self.assertEqual(code, 1)
         self.assertIn("larger than", err)
 
     def test_large_file_under_the_cap_is_linted(self):
         line = "الجو اليوم حلو مرّة وبنروح البر بعدين.\n"
         path = self.write("large.txt", line * 20000 + "عندي 5\n")
-        code, out, err = run_cli(["--format", "json", "--", path])
+        code, out, err = run_cli(["--all-lines", "--format", "json", "--", path])
         data = json.loads(out)
         self.assertEqual(code, 2)
         self.assertEqual(data["findings"][0]["line"], 20001)
 
     def test_empty_file_gets_a_note(self):
         path = self.write("empty.txt", "")
-        code, out, err = run_cli(["--", path])
+        code, out, err = run_cli(["--all-lines", "--", path])
         self.assertEqual(code, 0)
         self.assertIn("no lines were checked", out)
 
     def test_option_looking_file_name(self):
         self.write("--pack.txt", "عندي 5\n")
-        done = subprocess.run([sys.executable, "-X", "utf8", SCRIPT, "--", "--pack.txt"], cwd=self.dir,
+        done = subprocess.run([sys.executable, "-X", "utf8", SCRIPT, "--all-lines", "--", "--pack.txt"], cwd=self.dir,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         self.assertEqual(done.returncode, 2)
         self.assertIn("--pack.txt:1:6:", done.stdout.decode("utf-8"))
@@ -531,7 +531,7 @@ class CliTests(TempDirCase):
     def test_control_and_bidi_characters_never_reach_the_terminal(self):
         path = self.write("ctl.txt", "قال \x1b[31mHello\x07‮ World⁦ الآن\n")
         for fmt in ("text", "json"):
-            code, out, err = run_cli(["--format", fmt, "--", path])
+            code, out, err = run_cli(["--all-lines", "--format", fmt, "--", path])
             payload = out if fmt == "text" else "".join(
                 f["text"] + f["message"] for f in json.loads(out)["findings"])
             for ch in ("\x1b", "\x07", "‮", "⁦"):
@@ -543,7 +543,7 @@ class CliTests(TempDirCase):
                 "'; DROP TABLE packs; --\n")
         path = self.write("inject.txt", text)
         before = sorted(os.listdir(self.dir))
-        code, out, err = run_cli(["--", path])
+        code, out, err = run_cli(["--all-lines", "--", path])
         self.assertEqual(code, 2)
         self.assertEqual(err, "")
         self.assertEqual(sorted(os.listdir(self.dir)), before)
@@ -563,8 +563,8 @@ class CliTests(TempDirCase):
             return state
 
         before = snapshot()
-        run_cli(["--", path])
-        run_cli(["--format", "json", "--", path])
+        run_cli(["--all-lines", "--", path])
+        run_cli(["--all-lines", "--format", "json", "--", path])
         run_cli(["--list-packs", "--pack-dir", self.dir])
         self.assertEqual(snapshot(), before)
 
@@ -582,7 +582,8 @@ class SaudiPackTests(unittest.TestCase):
         cls.pack = lahja.find_pack("saudi")
 
     def ids(self, text):
-        return [f["rule"].split("/")[1] for f in lahja.lint_text(text, self.pack)[0]]
+        found = lahja.lint_text(text, self.pack, None, lahja.effective_scope(self.pack, "all"))[0]
+        return [f["rule"].split("/")[1] for f in found]
 
     def test_dialect_sentences_are_clean(self):
         text = ("وش رايك نروح البر الحين؟\n"
@@ -612,6 +613,149 @@ class SaudiPackTests(unittest.TestCase):
 
 
 # ------------------------------------------------------------------ repository hygiene
+
+TAG = r"^\s*\[[^\]]+\]"
+
+
+def scoped(text, *rules, force=None, line_filter=None, **extra):
+    pack = pack_of(*rules, **extra)
+    return lahja.lint_text(text, pack, line_filter, lahja.effective_scope(pack, force))
+
+
+class ScopeTests(TempDirCase):
+    def tagged(self, **kw):
+        return {"scope": {"mode": "tagged", "tag_pattern": TAG}}
+
+    def test_default_scope_is_all(self):
+        pack = pack_of(rule(kind="numeral"))
+        self.assertEqual(pack["scope"]["mode"], "all")
+        found, checked = lahja.lint_text("a 1\n[x] 2", pack)
+        self.assertEqual([f["line"] for f in found], [1, 2])
+        self.assertEqual(checked, 2)
+
+    def test_tagged_lints_only_tagged_lines(self):
+        found, checked = scoped("# heading 1\nplain 2\n[narrator] says 3\n  [b] and 4",
+                                rule(kind="numeral"), **self.tagged())
+        self.assertEqual([(f["line"], f["text"]) for f in found], [(3, "3"), (4, "4")])
+        self.assertEqual(checked, 2)
+
+    def test_tag_itself_is_never_flagged(self):
+        found, checked = scoped("[intro] 12", rule(kind="latin"), **self.tagged())
+        self.assertEqual(found, [])
+        found, _ = scoped("[intro] hello world", rule(kind="latin"), **self.tagged())
+        self.assertEqual([f["text"] for f in found], ["hello", "world"])
+
+    def test_columns_refer_to_the_original_line(self):
+        found, _ = scoped("  [narrator]  abc 7", rule(kind="numeral"), **self.tagged())
+        self.assertEqual(found[0]["col"], 19)
+        self.assertEqual("  [narrator]  abc 7"[found[0]["col"] - 1], "7")
+
+    def test_tag_only_line_is_not_counted(self):
+        found, checked = scoped("[intro]\n[intro]   \n[x] 1", rule(kind="numeral"), **self.tagged())
+        self.assertEqual(checked, 1)
+        self.assertEqual(len(found), 1)
+
+    def test_forced_flags_override_the_pack(self):
+        text = "plain 1\n[x] 2"
+        found, _ = scoped(text, rule(kind="numeral"), force="all", **self.tagged())
+        self.assertEqual(len(found), 2)
+        found, _ = scoped(text, rule(kind="numeral"), force="tagged")
+        self.assertEqual([f["line"] for f in found], [2])
+        pack = pack_of(rule(kind="numeral"))
+        forced = lahja.effective_scope(pack, "tagged")
+        self.assertEqual(forced["tag_pattern"], lahja.DEFAULT_TAG_PATTERN)
+
+    def test_forced_tagged_uses_the_pack_pattern_when_it_has_one(self):
+        pack = pack_of(rule(kind="numeral"), scope={"mode": "all", "tag_pattern": r"^>>"})
+        found, _ = lahja.lint_text(">> a 1\n[x] 2", pack, None, lahja.effective_scope(pack, "tagged"))
+        self.assertEqual([f["line"] for f in found], [1])
+
+    def test_line_filter_combines_with_scope(self):
+        text = "[a] 1 keep\n[b] 2 drop\nplain 3 keep"
+        found, _ = scoped(text, rule(kind="numeral"), line_filter=re.compile("keep"), **self.tagged())
+        self.assertEqual([f["line"] for f in found], [1])
+        found, _ = scoped("[a] x 1 | 2", rule(kind="numeral"), line_filter=re.compile(r"\| (.*)$"),
+                          **self.tagged())
+        self.assertEqual([(f["text"], f["col"]) for f in found], [("2", 11)])
+
+    def test_arabic_text_and_columns(self):
+        line = "[المعلق] عندي ٣ كتب"
+        found, _ = scoped(line, rule(kind="numeral"), **self.tagged())
+        self.assertEqual(found[0]["text"], "٣")
+        self.assertEqual(line[found[0]["col"] - 1], "٣")
+
+    def test_crlf_and_bom_with_tagged_scope(self):
+        path = self.write("s.txt", b"\xef\xbb\xbf[a] x 1\r\nplain 2\r\n[b] y 3\r\n")
+        code, out, err = run_cli(["--pack", "plain-english", "--pack-dir", EXAMPLES, "--tagged-only",
+                                  "--format", "json", "--", path])
+        data = json.loads(out)
+        self.assertEqual(data["scope"]["mode"], "tagged")
+        self.assertEqual(data["summary"]["files"], 1)
+        self.assertTrue(all(f["line"] in (1, 3) for f in data["findings"]))
+        pack = pack_of(rule(kind="numeral"), **self.tagged())
+        found, _ = lahja.lint_text("[a] x 1\r\nplain 2\r\n[b] y 3\r\n", pack)
+        self.assertEqual([(f["line"], f["col"]) for f in found], [(1, 7), (3, 7)])
+
+    def test_long_line_in_tagged_scope(self):
+        pack = pack_of(rule(kind="numeral"), **self.tagged())
+        found, _ = lahja.lint_text("[a] " + "x" * 2100 + "\n" + "y" * 2100, pack)
+        self.assertEqual([f["rule"] for f in found], ["lahja/long-line"])
+        self.assertEqual(found[0]["line"], 1)
+
+    def assertBad(self, scope, text):
+        data = {"id": "t", "label": "x", "scope": scope, "rules": [rule(pattern="a")]}
+        with self.assertRaises(lahja.PackError) as ctx:
+            lahja.validate_pack(data, "t")
+        self.assertIn(text, str(ctx.exception))
+
+    def test_bad_scope_in_pack(self):
+        self.assertBad("tagged", "must be an object")
+        self.assertBad({}, "\"mode\" must be one of")
+        self.assertBad({"mode": "some"}, "\"mode\" must be one of")
+        self.assertBad({"mode": 3}, "\"mode\" must be one of")
+        self.assertBad({"mode": "tagged"}, "needs \"tag_pattern\"")
+        self.assertBad({"mode": "tagged", "tag_pattern": 5}, "must be a regex string")
+        self.assertBad({"mode": "all", "tag_pattern": None}, "must be a regex string")
+        self.assertBad({"mode": "tagged", "tag_pattern": "["}, "scope tag_pattern")
+        self.assertBad({"mode": "tagged", "tag_pattern": "(a+)+"}, "exponential")
+        self.assertBad({"mode": "tagged", "tag_pattern": "a*"}, "matches empty text")
+        self.assertBad({"mode": "tagged", "tag_pattern": "a" * 301}, "longer than 300")
+        self.assertBad({"mode": "all", "extra": 1}, "unknown key")
+
+    def test_cli_rejects_both_flags_and_bad_pack_scope(self):
+        path = self.write("a.txt", "[a] 1\n")
+        code, out, err = run_cli(["--all-lines", "--tagged-only", "--", path])
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.write_pack("bad", {"id": "bad", "label": "x", "scope": {"mode": "x"}, "rules": [rule(pattern="a")]})
+        code, out, err = run_cli(["--pack", "bad", "--pack-dir", self.dir, "--", path])
+        self.assertEqual(code, 1)
+        self.assertIn("scope", err)
+
+    def test_saudi_pack_is_tagged_and_flags_work(self):
+        pack = lahja.find_pack("saudi")
+        self.assertEqual(pack["scope"]["mode"], "tagged")
+        self.assertEqual(pack["scope"]["tag_pattern"], lahja.DEFAULT_TAG_PATTERN)
+        path = self.write("v.txt", "عندي 5 كتب\n[intro] عندي 6 كتب\n")
+        code, out, err = run_cli(["--format", "json", "--", path])
+        data = json.loads(out)
+        self.assertEqual(data["scope"], {"mode": "tagged", "tag_pattern": lahja.DEFAULT_TAG_PATTERN})
+        self.assertEqual({f["line"] for f in data["findings"]}, {2})
+        code, out, err = run_cli(["--all-lines", "--format", "json", "--", path])
+        data = json.loads(out)
+        self.assertEqual(data["scope"], {"mode": "all", "tag_pattern": None})
+        self.assertEqual({f["line"] for f in data["findings"]}, {1, 2})
+
+    def test_list_packs_shows_scope(self):
+        code, out, err = run_cli(["--list-packs", "--pack-dir", EXAMPLES])
+        rows = {l.split("\t")[0]: l for l in out.splitlines()}
+        self.assertIn("scope: tagged", rows["saudi"])
+        self.assertIn("scope: all", rows["plain-english"])
+        code, out, err = run_cli(["--list-packs", "--pack-dir", EXAMPLES, "--format", "json"])
+        packs = {r["id"]: r for r in json.loads(out)["packs"]}
+        self.assertEqual(packs["saudi"]["scope"]["mode"], "tagged")
+        self.assertEqual(packs["plain-english"]["scope"], {"mode": "all", "tag_pattern": None})
+
 
 class RepoTests(unittest.TestCase):
     def read(self, rel):

@@ -2,6 +2,7 @@
   "id": "saudi",
   "label": "Saudi white dialect (Gulf, Najdi-leaning) for voiceover",
   "description": "Catches formal (fus-ha) wording and text that speech engines misread in scripts meant to be spoken in everyday Saudi dialect.",
+  "scope": {"mode": "tagged", "tag_pattern": "^\\s*\\[[^\\]]+\\]"},
   "rules": [
     {
       "id": "tanween",

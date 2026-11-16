@@ -1,6 +1,6 @@
 {
   "name": "lahja",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deterministic linter for spoken-word scripts (voiceover, reels, podcasts) written in a dialect. Pluggable dialect packs, ships with a Saudi pack. Catches formal wording, digits, stray Latin letters and punctuation that speech engines misread. Read-only, Python standard library only.",
   "license": "MIT",
   "keywords": ["lint", "dialect", "arabic", "tts", "voiceover", "script"],

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """lahja: a deterministic linter for spoken-word scripts, driven by dialect packs.
 
-Usage: python lahja.py [--pack NAME] [--pack-dir DIR] [--format text|json] -- FILE [FILE ...]
+Usage: python lahja.py [--pack NAME] [--pack-dir DIR] [--format text|json]
+                       [--all-lines | --tagged-only] -- FILE [FILE ...]
        python lahja.py --list-packs [--pack-dir DIR]
 
 Read-only: it never writes a file and never opens a network connection.
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import unicodedata
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_PACK_BYTES = 256 * 1024
@@ -58,7 +59,10 @@ KIND_KEYS = {
     "latin": set(),
     "length": {"max_chars", "max_words", "sentence_end"},
 }
-PACK_KEYS = {"id", "label", "description", "line_filter", "rules"}
+PACK_KEYS = {"id", "label", "description", "line_filter", "scope", "rules"}
+SCOPE_MODES = ("all", "tagged")
+SCOPE_KEYS = {"mode", "tag_pattern"}
+DEFAULT_TAG_PATTERN = r"^\s*\[[^\]]+\]"
 
 
 class PackError(Exception):
@@ -417,6 +421,50 @@ def _build_rule(rule, index, seen):
             "allow": allow, "ignore_inside": pairs, "matcher": matcher}
 
 
+def _build_scope(raw):
+    """Validate the optional "scope" object. Returns {"mode", "tag_pattern", "tag_regex"}."""
+    if raw is None:
+        return {"mode": "all", "tag_pattern": None, "tag_regex": None}
+    if not isinstance(raw, dict):
+        raise PackError("\"scope\" must be an object like {\"mode\": \"tagged\", \"tag_pattern\": \"...\"}")
+    for key in raw:
+        if isinstance(key, str) and key.startswith("_"):
+            continue
+        if key not in SCOPE_KEYS:
+            raise PackError("scope: unknown key \"%s\"" % sanitize(key, 40))
+    mode = raw.get("mode")
+    if not isinstance(mode, str) or mode not in SCOPE_MODES:
+        raise PackError("scope: \"mode\" must be one of %s" % ", ".join(SCOPE_MODES))
+    pattern = raw.get("tag_pattern")
+    if pattern is None:
+        if "tag_pattern" in raw:
+            raise PackError("scope: \"tag_pattern\" must be a regex string")
+        if mode == "tagged":
+            raise PackError("scope: mode \"tagged\" needs \"tag_pattern\" (a regex string)")
+        return {"mode": mode, "tag_pattern": None, "tag_regex": None}
+    if not isinstance(pattern, str):
+        raise PackError("scope: \"tag_pattern\" must be a regex string")
+    return {"mode": mode, "tag_pattern": pattern,
+            "tag_regex": compile_guarded(pattern, "scope tag_pattern")}
+
+
+def effective_scope(pack, force=None):
+    """The scope used for a run. force is None, "all" or "tagged" (from the command line)."""
+    scope = pack["scope"]
+    mode = force or scope["mode"]
+    if mode == "all":
+        return {"mode": "all", "tag_pattern": scope["tag_pattern"], "tag_regex": None}
+    if scope["tag_regex"] is not None:
+        return {"mode": "tagged", "tag_pattern": scope["tag_pattern"], "tag_regex": scope["tag_regex"]}
+    return {"mode": "tagged", "tag_pattern": DEFAULT_TAG_PATTERN,
+            "tag_regex": compile_guarded(DEFAULT_TAG_PATTERN, "default tag pattern")}
+
+
+def scope_info(scope):
+    return {"mode": scope["mode"],
+            "tag_pattern": scope["tag_pattern"] if scope["mode"] == "tagged" else None}
+
+
 def validate_pack(data, expected_id=None):
     """Check a decoded pack against the schema and compile it. Raises PackError."""
     if not isinstance(data, dict):
@@ -439,6 +487,7 @@ def validate_pack(data, expected_id=None):
         if not isinstance(data["line_filter"], str):
             raise PackError("\"line_filter\" must be a regex string")
         line_filter = compile_guarded(data["line_filter"], "line_filter")
+    scope = _build_scope(data["scope"] if "scope" in data else None)
     rules = data.get("rules")
     if not isinstance(rules, list) or not rules:
         raise PackError("\"rules\" must be a non-empty list")
@@ -447,7 +496,7 @@ def validate_pack(data, expected_id=None):
     seen = set()
     compiled = [_build_rule(rule, i, seen) for i, rule in enumerate(rules)]
     return {"id": pack_id, "label": label, "description": description,
-            "line_filter": line_filter, "rules": compiled}
+            "line_filter": line_filter, "scope": scope, "rules": compiled}
 
 
 def load_pack_file(path, expected_id=None):
@@ -501,10 +550,11 @@ def list_packs(pack_dir=None):
         for file_name in names[:MAX_PACKS_LISTED]:
             stem = file_name[:-5]
             row = {"id": sanitize(stem, 64), "source": source, "valid": False,
-                   "label": None, "rules": 0, "error": None, "shadowed": stem in seen}
+                   "label": None, "rules": 0, "scope": None, "error": None, "shadowed": stem in seen}
             try:
                 pack = load_pack_file(os.path.join(folder, file_name), stem)
-                row.update(valid=True, label=pack["label"], rules=len(pack["rules"]))
+                row.update(valid=True, label=pack["label"], rules=len(pack["rules"]),
+                           scope=scope_info(effective_scope(pack)))
             except PackError as exc:
                 row["error"] = str(exc)
             seen.add(stem)
@@ -551,26 +601,38 @@ def _snippet(segment, start, end):
     return sanitize(segment[start:end], SNIPPET_CHARS)
 
 
-def lint_text(text, pack, line_filter=None):
-    """Lint decoded text. Returns (findings, lines_checked). Columns are 1-based code points."""
+def lint_text(text, pack, line_filter=None, scope=None):
+    """Lint decoded text. Returns (findings, lines_checked). Columns are 1-based code points.
+
+    scope is a dict from effective_scope(); None means the pack's own scope. In tagged mode only
+    lines where the tag regex matches are linted, and the matched tag itself is hidden from the rules.
+    """
     findings = []
     checked = 0
     capped_at = 0
     active_filter = line_filter if line_filter is not None else pack["line_filter"]
     pack_id = pack["id"]
+    tag_regex = (scope if scope is not None else effective_scope(pack))["tag_regex"]
     for number, line in enumerate(NEWLINE_RE.split(text), 1):
-        offset = 0
-        segment = line
+        start, end = 0, len(line)
+        too_long = len(line) > MAX_LINE_CHARS
         if active_filter is not None:
-            if len(line) > MAX_LINE_CHARS:
+            if too_long:
                 m = None
             else:
                 m = active_filter.search(line)
                 if m is None:
                     continue
             if m is not None and active_filter.groups >= 1 and m.group(1) is not None:
-                segment = m.group(1)
-                offset = m.start(1)
+                start, end = m.start(1), m.end(1)
+        if tag_regex is not None:
+            tag = tag_regex.search(line[:MAX_LINE_CHARS] if too_long else line)
+            if tag is None:
+                continue
+            start = max(start, tag.end())
+            end = max(end, start)
+        offset = start
+        segment = line[start:end]
         if not segment.strip():
             continue
         checked += 1
@@ -651,6 +713,11 @@ def build_parser():
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--line-filter", metavar="REGEX",
                         help="lint only lines matching REGEX; if it has a group, only group 1 is linted")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--all-lines", action="store_true",
+                       help="lint every non-empty line, ignoring the pack's scope")
+    group.add_argument("--tagged-only", action="store_true",
+                       help="lint only lines that start with a [tag], even if the pack says all lines")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, metavar="SECONDS",
                         help="hard limit for the whole run (default: %d)" % DEFAULT_TIMEOUT)
     parser.add_argument("--version", action="version", version="lahja " + VERSION)
@@ -680,7 +747,10 @@ def _run_list(args):
         for row in rows:
             note = " (hidden by a custom pack with the same id)" if row["shadowed"] else ""
             if row["valid"]:
-                print("%s\t%s\t%d rules\t%s%s" % (row["id"], row["source"], row["rules"], row["label"], note))
+                sc = row["scope"]
+                shown = "all" if sc["mode"] == "all" else "tagged " + sc["tag_pattern"]
+                print("%s\t%s\t%d rules\tscope: %s\t%s%s"
+                      % (row["id"], row["source"], row["rules"], sanitize(shown, 100), row["label"], note))
             else:
                 print("%s\t%s\tINVALID: %s" % (row["id"], row["source"], row["error"]))
     return 1 if bad else 0
@@ -695,6 +765,8 @@ def _run_lint(args):
     cli_filter = None
     if args.line_filter is not None:
         cli_filter = compile_guarded(args.line_filter, "--line-filter")
+    force = "all" if args.all_lines else ("tagged" if args.tagged_only else None)
+    scope = effective_scope(pack, force)
     all_findings = []
     tool_errors = []
     notes = []
@@ -705,10 +777,10 @@ def _run_lint(args):
         except ToolError as exc:
             tool_errors.append({"file": shown, "message": str(exc)})
             continue
-        findings, checked = lint_text(text, pack, cli_filter)
+        findings, checked = lint_text(text, pack, cli_filter, scope)
         if checked == 0:
             notes.append({"file": shown, "message": "no lines were checked (empty file, or nothing "
-                                                    "matched the line filter)"})
+                                                    "matched the line filter or the scope)"})
         for finding in findings:
             finding["file"] = shown
             all_findings.append(finding)
@@ -719,6 +791,7 @@ def _run_lint(args):
                     "severity": f["severity"], "message": f["message"], "text": f["text"],
                     "fix": f["fix"]} for f in all_findings]
         print(json.dumps({"tool": "lahja", "version": VERSION, "pack": pack["id"],
+                          "scope": scope_info(scope),
                           "findings": ordered, "tool_errors": tool_errors, "notes": notes,
                           "summary": {"files": len(args.files), "error": errors, "warn": warns,
                                       "tool_errors": len(tool_errors)}},
